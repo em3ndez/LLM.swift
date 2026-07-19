@@ -219,11 +219,201 @@ final class LLMTests {
     
     @Test
     func testInitializerWithTempate() async throws {
-        let template = model.template
+        let template = model.template!
         let bot = try await LLM(from: model)!
         #expect(bot.preprocess(userPrompt, [], .none) == template.preprocess(userPrompt, [], .none))
     }
+
+    //MARK: Interruption tests
+
+    // reads are bounded so unbounded rambling cannot overrun the context,
+    // which would fail generation for reasons unrelated to interruption
+    private func read(_ bot: LLM, _ prompt: String, limit: Int, stopping: Bool) async -> Int {
+        var count = 0
+        await bot.respond(to: prompt) { stream in
+            var output = ""
+            for await delta in stream {
+                output += delta
+                count += 1
+                if count >= limit {
+                    if stopping { bot.stop() }
+                    break
+                }
+            }
+            return output
+        }
+        return count
+    }
+
+    @Test
+    func testConfigurationSettlesBeforeResponding() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        bot.seed = 42
+        await bot.respond(to: "Say hello in one word.")
+        let firstOutput = bot.output
+
+        bot.reset()
+        bot.seed = 42
+        await bot.respond(to: "Say hello in one word.")
+        #expect(bot.output == firstOutput)
+    }
+
+    @Test
+    func testStopDoesNotLeakIntoTheNextGeneration() async throws {
+        let bot = try await LLM(from: model)!
+
+        _ = await read(bot, "Write a long story about the sea.", limit: 3, stopping: true)
+        bot.history.removeAll()
+
+        let produced = await read(bot, "Say hi.", limit: 5, stopping: false)
+        #expect(produced > 0)
+    }
+
+    @Test
+    func testRepeatedStopAndGenerateCycles() async throws {
+        let bot = try await LLM(from: model)!
+
+        for _ in 0..<3 {
+            _ = await read(bot, "Write a long story about the sea.", limit: 3, stopping: true)
+            bot.history.removeAll()
+
+            let produced = await read(bot, "Say hi.", limit: 5, stopping: false)
+            #expect(produced > 0)
+
+            bot.history.removeAll()
+        }
+    }
     
+    lazy var embeddedTemplateModel = HuggingFaceModel("unsloth/Qwen3-0.6B-GGUF", .Q4_K_M)
+
+    struct GetWeather: Tool {
+        let description = "Get the current weather for a city"
+
+        @Generatable
+        struct Arguments {
+            let city: String
+        }
+
+        func call(_ arguments: Arguments) async throws -> String {
+            "It is sunny and 22 degrees celsius in \(arguments.city)."
+        }
+    }
+
+    struct GetBrokenWeather: Tool {
+        struct WeatherUnavailable: Error {}
+        let name = "GetWeather"
+        let description = "Get the current weather for a city"
+
+        @Generatable
+        struct Arguments {
+            let city: String
+        }
+
+        func call(_ arguments: Arguments) async throws -> String {
+            throw WeatherUnavailable()
+        }
+    }
+
+    @Test
+    func testEmbeddedChatTemplateRendering() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        let messagesJSON = """
+        [{"role":"system","content":"You are a helpful assistant."},{"role":"user","content":"hi"}]
+        """
+        let rendered = try await bot.core.renderChatPrompt(messagesJSON: messagesJSON, toolsJSON: nil, enableThinking: false)
+        #expect(rendered.prompt.contains("<|im_start|>system\nYou are a helpful assistant."))
+        #expect(rendered.prompt.contains("<|im_start|>user\nhi"))
+        #expect(rendered.prompt.hasSuffix("<|im_start|>assistant\n") || rendered.prompt.contains("<|im_start|>assistant"))
+    }
+
+    @Test
+    func testEmbeddedChatTemplateResponse() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        await bot.respond(to: "Say hello in one word.")
+        #expect(!bot.output.isEmpty)
+        #expect(!bot.output.contains("<|im_start|>"))
+        #expect(!bot.output.contains("<think>"))
+    }
+
+    @Test
+    func testEmbeddedChatTemplateIncrementalContext() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        await bot.respond(to: "Say hello in one word.")
+        let countAfterFirstTurn = await bot.core.getContextTokenCount()
+        await bot.respond(to: "Say goodbye in one word.")
+        let countAfterSecondTurn = await bot.core.getContextTokenCount()
+        #expect(countAfterFirstTurn > 0)
+        #expect(countAfterSecondTurn < countAfterFirstTurn * 3)
+    }
+
+    @Test
+    func testEmbeddedChatTemplateThinkingSeparation() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        await bot.respond(to: "What is 2+2?", thinking: .enabled)
+        #expect(!bot.output.isEmpty)
+        #expect(!bot.thinking.isEmpty)
+        #expect(!bot.output.contains("<think>"))
+        #expect(!bot.output.contains("</think>"))
+    }
+
+    @Test
+    func testStopInterruptsGeneration() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        let responder = Task { await bot.respond(to: "Write a very long, detailed story about the ocean.") }
+        for _ in 0..<600 {
+            if !bot.output.isEmpty { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        bot.stop()
+        await responder.value
+        #expect(!bot.output.isEmpty)
+        #expect(bot.output.count < 1000)
+    }
+
+    @Test
+    func testToolCalling() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        bot.systemPrompt = "You are a helpful assistant."
+        bot.tools = [GetWeather()]
+        await bot.respond(to: "What is the weather in Seoul right now? Use the GetWeather tool.")
+        print("===========toolCalls===========\n\(bot.toolCalls)\n===========output===========\n\(bot.output)\n===========end===========")
+        #expect(!bot.toolCalls.isEmpty)
+        #expect(bot.toolCalls.first?.name == "GetWeather")
+        #expect(!bot.output.contains("<tool_call>"))
+        #expect(!bot.output.isEmpty)
+    }
+
+    @Test
+    func testToolArgumentDecodingFailureSurfacesToModel() async throws {
+        let result = try? await GetWeather().invoke("not json")
+        #expect(result == nil)
+    }
+
+    @Test
+    func testToolSignaturesJSON() throws {
+        let signaturesJSON = ([GetWeather()] as [any Tool]).signaturesJSON!
+        let signatures = try JSONSerialization.jsonObject(with: Data(signaturesJSON.utf8)) as! [[String: Any]]
+        let function = signatures[0]["function"] as! [String: Any]
+        let parameters = function["parameters"] as! [String: Any]
+        let properties = parameters["properties"] as! [String: Any]
+        #expect(signatures.count == 1)
+        #expect(signatures[0]["type"] as? String == "function")
+        #expect(function["name"] as? String == "GetWeather")
+        #expect(function["description"] as? String == "Get the current weather for a city")
+        #expect(properties["city"] != nil)
+    }
+
+    @Test
+    func testToolFailureFeedsErrorBackToModel() async throws {
+        let bot = try await LLM(from: embeddedTemplateModel)!
+        bot.systemPrompt = "You are a helpful assistant."
+        bot.tools = [GetBrokenWeather()]
+        await bot.respond(to: "What is the weather in Seoul right now? Use the GetWeather tool.")
+        #expect(!bot.toolCalls.isEmpty)
+        #expect(bot.toolCalls.allSatisfy { $0.result.contains("tool failed") })
+        #expect(!bot.output.isEmpty)
+    }
+
     @Test
     func testInferenceFromHuggingFaceModel() async throws {
         let bot = try await LLM(from: model)!
@@ -268,8 +458,7 @@ final class LLMTests {
     func testEncodingDecodingFromHuggingFaceModel() async throws {
         let bot = try await LLM(from: model)!
         let input = "have you heard of this so-called LLM.swift library?"
-        var tokens = await bot.core.encode(input)
-        tokens.removeLast()
+        let tokens = await bot.core.encode(input)
         var decoded = ""
         for token in tokens {
             decoded += await bot.core.decode(token)
@@ -634,7 +823,8 @@ final class LLMTests {
     @Test
     func testNestedGeneratableStruct() async throws {
         let bot = try await LLM(from: model)!
-        
+        bot.seed = 42
+
         let result = try await bot.respond(
             to: "Create a restaurant with name, cuisine type, and location (latitude and longitude coordinates).",
             as: Restaurant.self
@@ -761,7 +951,7 @@ final class LLMTests {
     }
     
     @Generatable
-    struct Task {
+    struct Ticket {
         let title: String
         let priority: Priority
         let assignee: Person
@@ -770,17 +960,18 @@ final class LLMTests {
     @Generatable
     struct Project {
         let name: String
-        let tasks: [Task]
+        let tickets: [Ticket]
         let teamLead: Person
         let office: Address
     }
     
     @Test
     func testNestedGeneratableStructures() async throws {
-        let bot = try await LLM(from: model)!
-        
+        let bot = try await LLM(from: model, maxTokenCount: 4096)!
+        bot.seed = 42
+
         let result = try await bot.respond(
-            to: "Create a software development project with tasks, team members, and office location details. Project name should be short and clear.",
+            to: "Create a software development project with tickets, team members, and office location details. Project name should be short and clear.",
             as: Project.self
         )
         let project = result.value
@@ -790,21 +981,21 @@ final class LLMTests {
         print("Raw output: \(output)")
         
         #expect(!project.name.isEmpty)
-        #expect(!project.tasks.isEmpty)
+        #expect(!project.tickets.isEmpty)
         #expect(!project.teamLead.name.isEmpty)
         #expect(project.teamLead.age > 0)
         #expect(!project.office.street.isEmpty)
         #expect(!project.office.city.isEmpty)
         
-        #expect(!project.tasks[0].title.isEmpty)
-        #expect(!project.tasks[0].assignee.name.isEmpty)
+        #expect(!project.tickets[0].title.isEmpty)
+        #expect(!project.tickets[0].assignee.name.isEmpty)
         
         let jsonData = output.data(using: String.Encoding.utf8)!
         let parsed = try JSONSerialization.jsonObject(with: jsonData) as! [String: Any]
         let office = parsed["office"] as! [String: Any]
-        let tasks = parsed["tasks"] as! [Any]
-        let firstTask = tasks[0] as! [String: Any]
-        let assignee = firstTask["assignee"] as! [String: Any]
+        let tickets = parsed["tickets"] as! [Any]
+        let firstTicket = tickets[0] as! [String: Any]
+        let assignee = firstTicket["assignee"] as! [String: Any]
         
         #expect(office["street"] is String)
         #expect(office["city"] is String)
